@@ -1,6 +1,7 @@
 package libv2ray
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -57,6 +58,15 @@ type consoleLogWriter struct {
 	logger *log.Logger // Standard logger
 }
 
+// callbackLogWriter implements corecommlog.Writer by forwarding each complete
+// log line to CoreCallbackHandler.OnEmitStatus(1, line).  Concurrent writes are
+// serialised by mu, and an internal bytes.Buffer avoids per-write allocations.
+type callbackLogWriter struct {
+	handler CoreCallbackHandler
+	mu      sync.Mutex
+	buf     bytes.Buffer
+}
+
 // setEnvVariable safely sets an environment variable and logs any errors encountered.
 func setEnvVariable(key, value string) {
 	if err := os.Setenv(key, value); err != nil {
@@ -92,11 +102,12 @@ func InitCoreEnv(envPath string, key string) {
 // NewCoreController initializes and returns a new CoreController instance
 // Sets up the console log handler and associates it with the provided callback handler
 func NewCoreController(s CoreCallbackHandler) *CoreController {
-	// Register custom logger
+	// Register callback-based logger so Java receives Xray console lines via
+	// OnEmitStatus(1, line).
 	if err := coreapplog.RegisterHandlerCreator(
 		coreapplog.LogType_Console,
 		func(lt coreapplog.LogType, options coreapplog.HandlerCreatorOptions) (corecommlog.Handler, error) {
-			return corecommlog.NewLogger(createStdoutLogWriter()), nil
+			return corecommlog.NewLogger(createCallbackLogWriter(s)), nil
 		},
 	); err != nil {
 		log.Printf("Failed to register log handler: %v", err)
@@ -343,5 +354,50 @@ func createStdoutLogWriter() corecommlog.WriterCreator {
 		return &consoleLogWriter{
 			logger: log.New(os.Stdout, "", 0),
 		}
+	}
+}
+
+// Write buffers s, splits on '\n', trims trailing '\r', and forwards each
+// complete line to the callback as OnEmitStatus(1, line).
+func (w *callbackLogWriter) Write(s string) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	w.buf.WriteString(s)
+	for {
+		idx := bytes.IndexByte(w.buf.Bytes(), '\n')
+		if idx < 0 {
+			break
+		}
+		// Consume the line content and the '\n' together.
+		raw := w.buf.Next(idx + 1)
+		line := string(bytes.TrimRight(raw[:idx], "\r"))
+		if line != "" {
+			w.handler.OnEmitStatus(1, line)
+		}
+	}
+	return nil
+}
+
+func (w *callbackLogWriter) Close() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	// Flush any remaining bytes that were not terminated by '\n'.
+	if w.buf.Len() > 0 {
+		line := string(bytes.TrimRight(w.buf.Bytes(), "\r"))
+		w.buf.Reset()
+		if line != "" {
+			w.handler.OnEmitStatus(1, line)
+		}
+	}
+	return nil
+}
+
+// createCallbackLogWriter returns a WriterCreator that routes log lines to the
+// provided CoreCallbackHandler via OnEmitStatus(1, line).
+func createCallbackLogWriter(handler CoreCallbackHandler) corecommlog.WriterCreator {
+	return func() corecommlog.Writer {
+		return &callbackLogWriter{handler: handler}
 	}
 }
